@@ -1,3 +1,4 @@
+
 #pragma once
 
 #include <array>
@@ -26,14 +27,14 @@ struct InjectionConfig {
   double max_start_move_distance = 0.5;  // safety: refuse longer first moves [m]
 
   // --- Shared: injection along TCP z axis (CartesianVelocities, S-curve) -----------------
-  double insert_velocity = 0.005;   // [m/s]  must be reachable within each program's depth
-  double retract_velocity = 0.005;  // [m/s]
+  double insert_velocity = 0.02;   // [m/s]  must be reachable within each program's depth
+  double retract_velocity = 0.02;  // [m/s]
   double injection_acc = 0.05;      // [m/s^2]
   double injection_jerk = 0.5;      // [m/s^3]
 
   // --- Shared: experiment ----------------------------------------------------------------
   int repetitions = 30;
-  std::string output_root = "Needle_experiment";
+  std::string output_root = "Needle_experiment";  // relative -> inside the project folder
 };
 
 // Entry point used by every program's main().

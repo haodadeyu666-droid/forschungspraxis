@@ -23,6 +23,8 @@ find_package(Eigen3 REQUIRED NO_MODULE)
 add_library(injection_common STATIC injection_common.cpp)
 target_include_directories(injection_common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(injection_common PUBLIC Franka::Franka Eigen3::Eigen)
+# Data is saved relative to the project folder, no matter where the program is started.
+target_compile_definitions(injection_common PRIVATE PROJECT_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_options(injection_common PRIVATE -Wall -Wextra -Wreturn-type)
 
 # One program per start orientation; they differ only in the start pose.

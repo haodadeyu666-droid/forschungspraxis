@@ -11,6 +11,7 @@
 
 #include <Eigen/Geometry>
 #include <franka/exception.h>
+#include <franka/model.h>
 #include <franka/robot.h>
 
 #include "scurve.h"
@@ -139,14 +140,28 @@ void moveToPose(franka::Robot& robot, const Eigen::Affine3d& target, const Injec
 struct LogRow {
   int phase;  // 1 = insert, 2 = retract
   double t;
-  double x, y, z;
-  double fx, fy, fz;
-  double s_cmd, v_cmd;
-  double depth_meas;  // measured TCP displacement along the needle axis from insertion start
+  std::array<double, 3> pos;       // measured TCP position in base frame [m]
+  std::array<double, 4> quat;      // measured TCP orientation in base frame (qx, qy, qz, qw)
+  std::array<double, 6> vel;       // measured TCP twist in base frame, J(q) * dq [m/s, rad/s]
+  std::array<double, 6> vel_cmd;   // commanded TCP twist in base frame [m/s, rad/s]
+  std::array<double, 6> wrench_O;  // estimated external wrench on TCP, base frame [N, Nm]
+  std::array<double, 6> wrench_K;  // same wrench in the TCP (stiffness) frame [N, Nm]
+  double s_cmd, v_cmd;             // S-curve: commanded insertion depth [m] and speed [m/s]
+  double depth_meas;  // measured TCP displacement along the needle axis from insertion start [m]
 };
 
-void moveAlongNeedle(franka::Robot& robot, const SCurveProfile& profile, double direction, int phase,
-                     const Eigen::Vector3d& insertion_start, std::vector<LogRow>& log) {
+const char* kLogHeader =
+    "phase,time,"
+    "x,y,z,qx,qy,qz,qw,"
+    "vx,vy,vz,wx,wy,wz,"
+    "vx_cmd,vy_cmd,vz_cmd,wx_cmd,wy_cmd,wz_cmd,"
+    "F_x,F_y,F_z,T_x,T_y,T_z,"
+    "F_x_tcp,F_y_tcp,F_z_tcp,T_x_tcp,T_y_tcp,T_z_tcp,"
+    "s_cmd,v_cmd,depth_meas\n";
+
+void moveAlongNeedle(franka::Robot& robot, const franka::Model& model, const SCurveProfile& profile,
+                     double direction, int phase, const Eigen::Vector3d& insertion_start,
+                     std::vector<LogRow>& log) {
   Eigen::Vector3d axis = Eigen::Vector3d::Zero();
   double time = 0.0;
   const double depth_offset = phase == 1 ? 0.0 : profile.distance();  // s_cmd as insertion depth
@@ -159,12 +174,29 @@ void moveAlongNeedle(franka::Robot& robot, const SCurveProfile& profile, double 
 
     const SCurveProfile::Sample cmd = profile.at(time);
     const double v = direction * cmd.v;
-    const Eigen::Vector3d p(state.O_T_EE[12], state.O_T_EE[13], state.O_T_EE[14]);
 
     if (log.size() < log.capacity()) {  // never reallocate inside the control loop
-      log.push_back({phase, time, p.x(), p.y(), p.z(),
-                     state.O_F_ext_hat_K[0], state.O_F_ext_hat_K[1], state.O_F_ext_hat_K[2],
-                     depth_offset + direction * cmd.s, v, (p - insertion_start).dot(axis)});
+      const Eigen::Affine3d T = toAffine(state.O_T_EE);
+      const Eigen::Vector3d p = T.translation();
+      const Eigen::Quaterniond q(T.rotation());
+      const std::array<double, 42> J_arr = model.zeroJacobian(franka::Frame::kEndEffector, state);
+      const Eigen::Matrix<double, 6, 1> twist =
+          Eigen::Map<const Eigen::Matrix<double, 6, 7>>(J_arr.data()) *
+          Eigen::Map<const Eigen::Matrix<double, 7, 1>>(state.dq.data());
+
+      LogRow r;
+      r.phase = phase;
+      r.t = time;
+      r.pos = {p.x(), p.y(), p.z()};
+      r.quat = {q.x(), q.y(), q.z(), q.w()};
+      for (int i = 0; i < 6; ++i) r.vel[i] = twist[i];
+      r.vel_cmd = state.O_dP_EE_c;
+      r.wrench_O = state.O_F_ext_hat_K;
+      r.wrench_K = state.K_F_ext_hat_K;
+      r.s_cmd = depth_offset + direction * cmd.s;
+      r.v_cmd = v;
+      r.depth_meas = (p - insertion_start).dot(axis);
+      log.push_back(r);
     }
 
     const std::array<double, 6> vel{{axis.x() * v, axis.y() * v, axis.z() * v, 0.0, 0.0, 0.0}};
@@ -175,13 +207,23 @@ void moveAlongNeedle(franka::Robot& robot, const SCurveProfile& profile, double 
   });
 }
 
+template <size_t N>
+void writeValues(std::ofstream& f, const std::array<double, N>& a) {
+  for (double x : a) f << ',' << x;
+}
+
 void writeLog(const std::string& path, const std::vector<LogRow>& log) {
   std::ofstream f(path);
-  f << "phase,time,x,y,z,F_x,F_y,F_z,s_cmd,v_cmd,depth_meas\n";
-  f << std::setprecision(9);
+  f << kLogHeader << std::setprecision(9);
   for (const auto& r : log) {
-    f << r.phase << ',' << r.t << ',' << r.x << ',' << r.y << ',' << r.z << ',' << r.fx << ','
-      << r.fy << ',' << r.fz << ',' << r.s_cmd << ',' << r.v_cmd << ',' << r.depth_meas << '\n';
+    f << r.phase << ',' << r.t;
+    writeValues(f, r.pos);
+    writeValues(f, r.quat);
+    writeValues(f, r.vel);
+    writeValues(f, r.vel_cmd);
+    writeValues(f, r.wrench_O);
+    writeValues(f, r.wrench_K);
+    f << ',' << r.s_cmd << ',' << r.v_cmd << ',' << r.depth_meas << '\n';
   }
 }
 
@@ -204,6 +246,7 @@ int run_injection_program(const InjectionConfig& c, int argc, char** argv) {
   try {
     franka::Robot robot(c.robot_ip);
     configureRobot(robot, c);
+    const franka::Model model = robot.loadModel();  // for measured Cartesian velocity
 
     if (arg == "--print-pose") {
       printPose("Current TCP pose (paste into the program to use it as start pose):",
@@ -216,7 +259,9 @@ int run_injection_program(const InjectionConfig& c, int argc, char** argv) {
     const SCurveProfile retract_profile(c.depth, c.retract_velocity, c.injection_acc, c.injection_jerk);
 
     const std::string condition = arg.empty() ? "correct" : arg;
-    const fs::path folder = fs::path(c.output_root) / condition / c.program_name;
+    fs::path root(c.output_root);
+    if (root.is_relative()) root = fs::path(PROJECT_DIR) / root;
+    const fs::path folder = root / condition / c.program_name;
     fs::create_directories(folder);
 
     const Eigen::Affine3d start_pose = poseFromConfig(c);
@@ -253,9 +298,9 @@ int run_injection_program(const InjectionConfig& c, int argc, char** argv) {
       const std::string file = (folder / ("rep" + std::to_string(rep) + ".csv")).string();
 
       try {
-        moveAlongNeedle(robot, insert_profile, +1.0, 1, insertion_start, log);
+        moveAlongNeedle(robot, model, insert_profile, +1.0, 1, insertion_start, log);
         std::cout << "Inserted. Measured depth: " << log.back().depth_meas * 1000 << " mm\n";
-        moveAlongNeedle(robot, retract_profile, -1.0, 2, insertion_start, log);
+        moveAlongNeedle(robot, model, retract_profile, -1.0, 2, insertion_start, log);
         std::cout << "Retracted. Residual: " << log.back().depth_meas * 1000 << " mm\n";
       } catch (...) {
         writeLog(file, log);  // keep what was recorded up to the error
